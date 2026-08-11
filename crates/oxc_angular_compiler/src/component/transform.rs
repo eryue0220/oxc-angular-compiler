@@ -524,10 +524,10 @@ pub fn build_import_map<'a>(
                         .map(|resolved| Ident::from(allocator.alloc_str(resolved)))
                         .unwrap_or_else(|| default_source_module.clone().into());
 
-                    // Capture the original exported name when it differs from the
-                    // local binding (i.e., `import { Foo as Bar }`). This is used
-                    // when building `@defer` dependency resolvers so the dynamic
-                    // import chain references the original export, not the alias.
+                    // `import { Foo as Bar }` → export name `Foo` for `i1.Foo` / @defer.
+                    // Path rewrite via `resolved_imports` does not change the export
+                    // name on the target (still `Foo`); only an extended API could
+                    // supply a different target export after a barrel rename.
                     let imported_export_name = module_export_name_to_str(&spec.imported);
                     let imported_name = imported_export_name
                         .filter(|exported| *exported != local_name.as_str())
@@ -651,7 +651,8 @@ fn resolve_factory_dep_namespaces<'a>(
                     )),
                     &allocator,
                 ),
-                name: name.clone(),
+                // Export name when aliased (`Foo as Bar` → `i1.Foo`).
+                name: import_info.imported_name.clone().unwrap_or_else(|| name.clone()),
                 optional: false,
                 source_span: None,
             },
@@ -688,7 +689,8 @@ fn resolve_host_directive_namespaces<'a>(
                     )),
                     &allocator,
                 ),
-                name: name.clone(),
+                // Export name when aliased (`Foo as Bar` → `i1.Foo`).
+                name: import_info.imported_name.clone().unwrap_or_else(|| name.clone()),
                 optional: false,
                 source_span: None,
             },
@@ -6841,6 +6843,111 @@ export class TestComponent {
         assert!(
             !result.code.contains("import * as i1 from './some.interface'"),
             "Should NOT generate namespace import for inline type-only import, but got:\n{}",
+            result.code
+        );
+    }
+
+    #[test]
+    fn test_aliased_import_di_token_uses_exported_name_in_factory_and_ctor_params() {
+        // Aliased DI token: factory inject and ctorParameters both use the export
+        // name (`i1.ExportedName`), never the local alias.
+        let allocator = Allocator::default();
+        let source = r#"
+import { Component } from '@angular/core';
+import { ExportedName as LocalAlias } from './svc';
+
+@Component({
+    selector: 'app-x',
+    template: '',
+    standalone: true,
+})
+export class X {
+    constructor(x: LocalAlias) {}
+}
+"#;
+
+        let mut options = TransformOptions::default();
+        options.emit_class_metadata = true;
+
+        let result =
+            transform_angular_file(&allocator, "x.component.ts", source, Some(&options), None);
+
+        assert!(!result.has_errors(), "Transform should not have errors: {:?}", result.diagnostics);
+
+        // Namespace import for the service module
+        assert!(
+            result.code.contains("import * as i1 from './svc'"),
+            "Should generate namespace import for './svc', but got:\n{}",
+            result.code
+        );
+
+        // Factory inject AND setClassMetadata ctorParameters must use the export name
+        assert!(
+            result.code.contains("i1.ExportedName"),
+            "Factory and/or ctorParameters should use i1.ExportedName, but got:\n{}",
+            result.code
+        );
+        assert!(
+            !result.code.contains("i1.LocalAlias"),
+            "Must not emit i1.LocalAlias (undefined on namespace); got:\n{}",
+            result.code
+        );
+
+        // setClassMetadata ctorParameters type field specifically
+        let ctor_params_ok = result.code.contains("type: i1.ExportedName")
+            || result.code.contains("type:i1.ExportedName");
+        assert!(
+            ctor_params_ok,
+            "setClassMetadata ctorParameters should use type: i1.ExportedName, but got:\n{}",
+            result.code
+        );
+    }
+
+    /// Path rewrite keeps the specifier export name: `Foo as Bar` + resolve to
+    /// `./pkg` still emits `i1.Foo` (target exports `Foo`, not `Bar`).
+    #[test]
+    fn test_resolved_imports_path_only_keeps_export_name() {
+        use std::collections::HashMap;
+
+        let allocator = Allocator::default();
+        let source = r#"
+import { Component } from '@angular/core';
+import { Foo as Bar } from '@pkg';
+
+@Component({
+    selector: 'app-x',
+    template: '',
+    standalone: true,
+})
+export class X {
+    constructor(x: Bar) {}
+}
+"#;
+
+        let mut resolved = HashMap::new();
+        resolved.insert("Bar".to_string(), "./pkg".to_string());
+
+        let mut options = TransformOptions::default();
+        options.emit_class_metadata = true;
+        options.resolved_imports = Some(resolved);
+
+        let result =
+            transform_angular_file(&allocator, "x.component.ts", source, Some(&options), None);
+
+        assert!(!result.has_errors(), "errors: {:?}", result.diagnostics);
+        assert!(
+            result.code.contains("import * as i1 from './pkg'"),
+            "namespace import should use resolved path; got:\n{}",
+            result.code
+        );
+        assert!(
+            result.code.contains("i1.Foo"),
+            "should keep export name Foo after path rewrite; got:\n{}",
+            result.code
+        );
+        assert!(
+            !result.code.contains("i1.Bar"),
+            "must not use local alias Bar on namespace; got:\n{}",
             result.code
         );
     }

@@ -775,7 +775,9 @@ fn build_param_type_expression<'a>(
                     type_name.as_ref().is_some_and(|tn| tn.as_str() == token.as_str());
 
                 if type_matches_token {
-                    let name = type_name.unwrap_or_else(|| token.clone());
+                    // `import { Foo as Bar }` + `constructor(x: Bar)` → `i1.Foo`.
+                    let local_name = type_name.unwrap_or_else(|| token.clone());
+                    let name = dep.token_imported_name.clone().unwrap_or_else(|| local_name);
                     let namespace = namespace_registry.get_or_assign(source_module);
                     return Some(OutputExpression::ReadProp(Box::new_in(
                         ReadPropExpr {
@@ -810,6 +812,8 @@ fn build_param_type_expression<'a>(
                 return None;
             }
             let namespace = namespace_registry.get_or_assign(&import_info.source_module);
+            // Prefer export name over local alias for namespace property access.
+            let name = import_info.imported_name.clone().unwrap_or_else(|| tn.clone());
             return Some(OutputExpression::ReadProp(Box::new_in(
                 ReadPropExpr {
                     receiver: Box::new_in(
@@ -819,7 +823,7 @@ fn build_param_type_expression<'a>(
                         )),
                         &allocator,
                     ),
-                    name: tn.clone(),
+                    name,
                     optional: false,
                     source_span: None,
                 },

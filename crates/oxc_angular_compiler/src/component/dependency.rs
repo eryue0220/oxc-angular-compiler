@@ -45,6 +45,12 @@ pub struct R3DependencyMetadata<'a> {
     /// `DIALOG_DATA` directly instead of `i1.DIALOG_DATA`.
     pub has_named_import: bool,
 
+    /// The module's exported name for this token, when it differs from the local
+    /// binding (i.e. an aliased import `import { Foo as Bar }` → `Some("Foo")`).
+    /// A namespace member access (`i1.X`) must use the export name, not the local
+    /// alias, or it resolves to `undefined` at runtime.
+    pub token_imported_name: Option<Ident<'a>>,
+
     /// For `@Attribute()` dependencies, the attribute name.
     /// `None` for regular dependencies.
     pub attribute_name: Option<Ident<'a>>,
@@ -78,6 +84,7 @@ impl<'a> R3DependencyMetadata<'a> {
             token: Some(token),
             token_source_module: None,
             has_named_import: false,
+            token_imported_name: None,
             attribute_name: None,
             host: false,
             optional: false,
@@ -93,6 +100,7 @@ impl<'a> R3DependencyMetadata<'a> {
             token: None,
             token_source_module: None,
             has_named_import: false,
+            token_imported_name: None,
             attribute_name: None,
             host: false,
             optional: false,
@@ -111,6 +119,7 @@ impl<'a> R3DependencyMetadata<'a> {
             token: None,
             token_source_module: None,
             has_named_import: false,
+            token_imported_name: None,
             attribute_name: None,
             host: false,
             optional: false,
@@ -150,6 +159,7 @@ impl<'a> R3DependencyMetadata<'a> {
             token: Some(attribute_name.clone()),
             token_source_module: None,
             has_named_import: false,
+            token_imported_name: None,
             attribute_name: Some(attribute_name),
             host: false,
             optional: false,
@@ -378,7 +388,8 @@ fn create_token_expression<'a>(
                     )),
                     &allocator,
                 ),
-                name: token_name.clone(),
+                // Export name when aliased (`Foo as Bar` → `i1.Foo`).
+                name: dep.token_imported_name.clone().unwrap_or_else(|| token_name.clone()),
                 optional: false,
                 source_span: None,
             },
@@ -536,6 +547,23 @@ mod tests {
         assert!(js.contains("ɵɵdirectiveInject"));
         assert!(js.contains("MyService"));
         assert!(!js.contains(",")); // No flags argument
+    }
+
+    #[test]
+    fn test_aliased_import_uses_exported_name() {
+        // Aliased DI token must use export name on the namespace object.
+        let allocator = Allocator::default();
+        let mut dep = R3DependencyMetadata::new(Ident::from("LocalAlias"));
+        dep.token_source_module = Some(Ident::from("@scope/pkg"));
+        dep.token_imported_name = Some(Ident::from("ExportedName"));
+        let mut registry = NamespaceRegistry::new(&allocator);
+
+        let result =
+            compile_inject_dependency(&allocator, &dep, FactoryTarget::Component, 0, &mut registry);
+        let js = JsEmitter::new().emit_expression(&result);
+
+        assert!(js.contains("ExportedName"), "should use exported name: {js}");
+        assert!(!js.contains("LocalAlias"), "must not use local alias: {js}");
     }
 
     #[test]
