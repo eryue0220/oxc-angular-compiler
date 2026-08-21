@@ -26,8 +26,60 @@
 //! - `::ng-deep` → removed (deprecated but still supported)
 //! - Media queries, keyframes, etc. → preserved
 
-/// Placeholder for comments during processing.
-const COMMENT_PLACEHOLDER: &str = "%COMMENT%";
+use std::ops::Range;
+
+/// Comments are replaced by `%COMMENT<n>%` placeholders during processing,
+/// where `<n>` is the comment's index in the extracted list.
+///
+/// Angular uses a bare `%COMMENT%` here, but that only restores correctly when
+/// every placeholder survives exactly once and in order. Neither holds: the
+/// `:host-context()` pass duplicates selector text (and any placeholder in it)
+/// once per generated permutation, and `polyfill-next-selector` discards text.
+/// With an unindexed placeholder each duplicate consumes the *next* comment,
+/// so a following `/*# sourceMappingURL=... */` gets teleported into the middle
+/// of a selector and a literal `%COMMENT%` is left behind in the shipped CSS.
+/// Carrying the index makes restoration independent of both count and order.
+const COMMENT_PLACEHOLDER_PREFIX: &str = "%COMMENT";
+
+/// The placeholder standing in for `comments[index]`.
+fn comment_placeholder(index: usize) -> String {
+    format!("{COMMENT_PLACEHOLDER_PREFIX}{index}%")
+}
+
+/// Find the comment placeholder at or after `from`, returning its byte range
+/// and the comment index it carries.
+fn find_comment_placeholder(s: &str, from: usize) -> Option<(Range<usize>, usize)> {
+    let mut at = from;
+    while let Some(rel) = s[at..].find(COMMENT_PLACEHOLDER_PREFIX) {
+        let start = at + rel;
+        let digits_at = start + COMMENT_PLACEHOLDER_PREFIX.len();
+        let after = &s[digits_at..];
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0
+            && after.as_bytes().get(digits) == Some(&b'%')
+            && let Ok(index) = after[..digits].parse()
+        {
+            return Some((start..digits_at + digits + 1, index));
+        }
+        at = digits_at;
+    }
+    None
+}
+
+/// Remove every comment placeholder from `s`, returning the cleaned text and
+/// the removed placeholders concatenated in their original order.
+fn strip_comment_placeholders(s: &str) -> (String, String) {
+    let mut cleaned = String::with_capacity(s.len());
+    let mut removed = String::new();
+    let mut at = 0;
+    while let Some((range, _)) = find_comment_placeholder(s, at) {
+        cleaned.push_str(&s[at..range.start]);
+        at = range.end;
+        removed.push_str(&s[range]);
+    }
+    cleaned.push_str(&s[at..]);
+    (cleaned, removed)
+}
 
 // Polyfill host markers (matching Angular's shadow_css.ts)
 const POLYFILL_HOST: &str = "-shadowcsshost";
@@ -354,6 +406,7 @@ fn extract_comments(css: &str) -> (String, Vec<String>) {
                 trimmed.starts_with('#') && trimmed[1..].trim_start().starts_with("source")
             };
 
+            let index = comments.len();
             if is_sourcemap {
                 comments.push(comment.to_string());
             } else {
@@ -368,7 +421,7 @@ fn extract_comments(css: &str) -> (String, Vec<String>) {
                 comments.push(preserved);
             }
 
-            result.push_str(COMMENT_PLACEHOLDER);
+            result.push_str(&comment_placeholder(index));
         } else {
             i += push_utf8_char(&mut result, css, i);
         }
@@ -378,18 +431,26 @@ fn extract_comments(css: &str) -> (String, Vec<String>) {
 }
 
 /// Restore comments from placeholders.
+///
+/// Every placeholder carries the index of the comment it stands for, so a
+/// placeholder that got duplicated (`:host-context()` permutations) restores to
+/// the same comment as its twin, and one that got dropped shifts nothing.
+///
+/// `extract_comments` only ever emits in-range indices, and the passes that
+/// copy selector text copy the index along with it, so every placeholder *we*
+/// generated resolves. An index that doesn't is therefore source CSS that
+/// merely looks like a placeholder (`content: "%COMMENT7%"`), and is left
+/// exactly as the author wrote it.
 fn restore_comments(css: &str, comments: &[String]) -> String {
-    let mut result = css.to_string();
-    let mut idx = 0;
+    let mut result = String::with_capacity(css.len());
+    let mut at = 0;
 
-    while result.find(COMMENT_PLACEHOLDER).is_some() {
-        if idx < comments.len() {
-            result = result.replacen(COMMENT_PLACEHOLDER, &comments[idx], 1);
-            idx += 1;
-        } else {
-            break;
-        }
+    while let Some((range, index)) = find_comment_placeholder(css, at) {
+        result.push_str(&css[at..range.start]);
+        result.push_str(comments.get(index).map_or(&css[range.start..range.end], String::as_str));
+        at = range.end;
     }
+    result.push_str(&css[at..]);
 
     result
 }
@@ -2048,6 +2109,30 @@ fn scope_selector_part_with_context(
         return String::new();
     }
 
+    // Detach any comment placeholders before anything inspects the selector.
+    // A comment can be glued straight onto the selector text (PostCSS reprints
+    // `/* why */\n.foo` as `/* why */.foo`), and every check below is a
+    // whole-string match: with `%COMMENT0%` still attached, `:where(.one)`
+    // stops looking like a pure pseudo-function and gets scoped as
+    // `[content]:where(.one)` instead of `:where(.one[content])` - which is a
+    // real cascade change, since `:where()` contributes no specificity. The
+    // placeholders restore to blank text, so re-emitting them in front is
+    // enough.
+    if selector.contains(COMMENT_PLACEHOLDER_PREFIX) {
+        // `%COMMENT` without a valid index isn't ours - fall through and treat
+        // it as ordinary selector text.
+        let (stripped, placeholders) = strip_comment_placeholders(selector);
+        if !placeholders.is_empty() {
+            if stripped.trim().is_empty() {
+                // Nothing but placeholder(s) - no real selector to scope. Must
+                // not fall through, or a lone comment would become a bare
+                // `[content]` matching every element in the component.
+                return selector.to_string();
+            }
+            return placeholders + &scope_selector_part_with_context(&stripped, ctx, part_has_host);
+        }
+    }
+
     // If this part IS the host marker, don't add content attr
     if !ctx.host_marker.is_empty() && selector.trim() == ctx.host_marker {
         return selector.to_string();
@@ -2243,10 +2328,9 @@ fn scope_simple_selector(selector: &str, content_attr: &str) -> String {
         return String::new();
     }
 
-    // Don't scope comment placeholders
-    if selector.contains(COMMENT_PLACEHOLDER) {
-        return selector.to_string();
-    }
+    // Comment placeholders are detached in `scope_selector_part_with_context`,
+    // which is upstream of every caller of this function, so the selector text
+    // here is already placeholder-free.
 
     // Already has the content attribute
     let attr = format!("[{}]", content_attr);
