@@ -42,6 +42,7 @@ import {
   locateStylesInArgs,
   locateTemplateInArgs,
   locateTemplateStringFor,
+  locateTemplateUrlFor,
 } from './utils/decorator-fields.js'
 import { injectDtsDeclarations } from './utils/dts.js'
 
@@ -268,10 +269,11 @@ export function angular(options: PluginOptions = {}): Plugin[] {
   // emits per-component HMR updates and we mirror that here.
   const componentsByFile = new Map<string, Set<string>>()
 
-  // Reverse mapping: resource file path → component file path. Multi-component
-  // files almost always use inline templates, so a single owner per resource is
-  // sufficient in practice; if a templateUrl/styleUrl is shared across multiple
-  // components in the same file, only one will receive the HMR event.
+  // Reverse mapping: resource file path → component file path. Single-valued:
+  // the last transform to reference a resource owns the slot. Multiple
+  // components in the SAME file are covered by `dispatchAllComponentsInFile`;
+  // a resource shared across component FILES is covered by the multi-valued
+  // owner maps (`templateComponentOwners`, `styleComponentOwners`).
   const resourceToComponent = new Map<string, string>()
 
   // Cache for resolved resources
@@ -293,12 +295,23 @@ export function angular(options: PluginOptions = {}): Plugin[] {
   // Windows, where cache keys keep the platform-native separators.
   const directStyleUrls = new Set<string>()
 
+  // Every file used as a direct `templateUrl` of some component (normalized
+  // paths). A templateUrl is not required to end in `.html`, so template
+  // ownership is tracked by this ROLE set, not by file extension.
+  const directTemplateUrls = new Set<string>()
+
   // Direct component owners of each compiled style (normalized style path →
   // component files referencing it as a styleUrl). Unlike
   // `resourceToComponent`, this is multi-valued: a style shared by several
   // components must dispatch HMR to every one of them when the style or one of
   // its preprocessor deps changes.
   const styleComponentOwners = new Map<string, Set<string>>()
+
+  // Direct component owners of each external template (normalized template
+  // path → component files referencing it as a templateUrl). Mirrors
+  // `styleComponentOwners`: a template shared by several component files must
+  // dispatch HMR to every one of them when it changes (issue #445).
+  const templateComponentOwners = new Map<string, Set<string>>()
 
   // Record the preprocessor dependencies of a compiled style and rebuild the
   // reverse map (dep -> owning styles). Replaces any previous registration for
@@ -426,6 +439,9 @@ export function angular(options: PluginOptions = {}): Plugin[] {
       dependencies.push(templatePath)
 
       const normalizedTemplatePath = normalizePath(templatePath)
+      // Register as a direct template regardless of read outcome, mirroring
+      // `directStyleUrls`: ownership is by role, not extension.
+      directTemplateUrls.add(normalizedTemplatePath)
       let content = resourceCache.get(normalizedTemplatePath)
       if (!content) {
         try {
@@ -638,16 +654,31 @@ export function angular(options: PluginOptions = {}): Plugin[] {
               const { templateUrls, styleUrls } = await extractComponentUrls(source, resolvedId)
               const dir = dirname(resolvedId)
 
-              // Read fresh template content (bypass cache for HMR)
-              let templateContent: string | null = null
-              if (templateUrls.length > 0) {
-                const templatePath = resolve(dir, templateUrls[0])
-                templateContent = await readFile(templatePath, 'utf-8')
+              // Read fresh template content (bypass cache for HMR). Resolve
+              // it per CLASS: in a multi-component file, templateUrls[0] is
+              // the FILE's first external template, which may belong to a
+              // sibling — serving it would replace this class's template with
+              // the sibling's markup. Prefer the requested class's own
+              // templateUrl, then its inline template; fall back to
+              // templateUrls[0] only for decorator shapes the per-class
+              // locator cannot parse (preserves the old behavior there).
+              const readTemplate = async (url: string) => {
+                const templatePath = resolve(dir, url)
+                let content = await readFile(templatePath, 'utf-8')
                 if (options.templateTransform) {
-                  templateContent = options.templateTransform(templateContent, templatePath)
+                  content = options.templateTransform(content, templatePath)
                 }
+                return content
+              }
+              let templateContent: string | null = null
+              const classTemplateUrl = extractTemplateUrlFor(source, className)
+              if (classTemplateUrl !== null) {
+                templateContent = await readTemplate(classTemplateUrl)
               } else {
                 templateContent = extractInlineTemplate(source, className)
+                if (templateContent === null && templateUrls.length > 0) {
+                  templateContent = await readTemplate(templateUrls[0])
+                }
               }
 
               if (templateContent) {
@@ -814,6 +845,12 @@ export function angular(options: PluginOptions = {}): Plugin[] {
                 if (owners.size === 0) styleComponentOwners.delete(style)
               }
             }
+            for (const [template, owners] of templateComponentOwners) {
+              if (owners.has(actualId) && !newDeps.has(template)) {
+                owners.delete(actualId)
+                if (owners.size === 0) templateComponentOwners.delete(template)
+              }
+            }
 
             for (const dep of dependencies) {
               const normalizedDep = normalizePath(dep)
@@ -823,6 +860,14 @@ export function angular(options: PluginOptions = {}): Plugin[] {
               if (directStyleUrls.has(normalizedDep)) {
                 let owners = styleComponentOwners.get(normalizedDep)
                 if (!owners) styleComponentOwners.set(normalizedDep, (owners = new Set()))
+                owners.add(actualId)
+              }
+              // Every component that uses an external template is an owner of
+              // it. Membership is by ROLE (`directTemplateUrls`), not by
+              // extension — a templateUrl may point at any file name.
+              if (directTemplateUrls.has(normalizedDep)) {
+                let owners = templateComponentOwners.get(normalizedDep)
+                if (!owners) templateComponentOwners.set(normalizedDep, (owners = new Set()))
                 owners.add(actualId)
               }
               // Watch the file so edits reach `handleHotUpdate` even when it
@@ -1038,11 +1083,16 @@ export function angular(options: PluginOptions = {}): Plugin[] {
           }
           // A changed file can be BOTH a shared dep of one component's style
           // and another component's direct templateUrl/styleUrl — process both
-          // roles before returning (no early return above). Direct styles are
-          // also reachable via styleComponentOwners alone: once the last
-          // resourceToComponent owner switches styles, its prune removes the
-          // single-valued entry while the remaining shared-style owners stay.
-          if (resourceToComponent.has(normalizedFile) || styleComponentOwners.has(normalizedFile)) {
+          // roles before returning (no early return above). Direct styles and
+          // templates are also reachable via their owner maps alone: once the
+          // last resourceToComponent owner switches resources, its prune
+          // removes the single-valued entry while the remaining shared owners
+          // stay.
+          if (
+            resourceToComponent.has(normalizedFile) ||
+            styleComponentOwners.has(normalizedFile) ||
+            templateComponentOwners.has(normalizedFile)
+          ) {
             // Stylesheets that only appear as transitive deps of other styles
             // (never used as a direct styleUrl) were already handled by the
             // shared-dep branch; skip them here to avoid a duplicate update.
@@ -1063,10 +1113,13 @@ export function angular(options: PluginOptions = {}): Plugin[] {
                   }
                 }
               } else {
-                const componentFile = resourceToComponent.get(normalizedFile)
-                if (componentFile && dispatchAllComponentsInFile(componentFile)) {
-                  debugHmr('external resource HMR: %s -> %s', normalizedFile, componentFile)
-                  handled = true
+                // A template shared by several component files updates every
+                // one of them (resourceToComponent is single-valued).
+                for (const owner of templateComponentOwners.get(normalizedFile) ?? []) {
+                  if (dispatchAllComponentsInFile(owner)) {
+                    debugHmr('external resource HMR: %s -> %s', normalizedFile, owner)
+                    handled = true
+                  }
                 }
               }
             }
@@ -1334,6 +1387,18 @@ export function angular(options: PluginOptions = {}): Plugin[] {
  */
 function extractInlineTemplate(code: string, className: string): string | null {
   const range = locateTemplateStringFor(code, className)
+  if (!range) return null
+  // Slice excludes the outer quotes/backticks — raw inner contents.
+  return code.slice(range[0] + 1, range[1])
+}
+
+/**
+ * Extract the `templateUrl` string from the `@Component({...})` decorator
+ * that decorates the class named `className`. Returns null if no such
+ * decorator exists or the decorator has no `templateUrl:` string literal.
+ */
+function extractTemplateUrlFor(code: string, className: string): string | null {
+  const range = locateTemplateUrlFor(code, className)
   if (!range) return null
   // Slice excludes the outer quotes/backticks — raw inner contents.
   return code.slice(range[0] + 1, range[1])
