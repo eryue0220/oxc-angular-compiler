@@ -14,7 +14,7 @@ import { ServerResponse } from 'node:http'
 import { dirname, resolve } from 'node:path'
 
 import { createDebug } from 'obug'
-import type { Plugin, ResolvedConfig, ViteDevServer, Connect } from 'vite'
+import type { Plugin, ResolvedConfig, ViteDevServer, Connect, ModuleNode } from 'vite'
 import { preprocessCSS, normalizePath } from 'vite'
 
 // Debug loggers - enable with DEBUG=vite:oxc-angular:*
@@ -151,7 +151,39 @@ export interface PluginOptions {
 
 // Match all TypeScript files - we'll filter by @Component/@Directive decorator in the handler
 const ANGULAR_TS_REGEX = /\.tsx?$/
+const TEMPLATE_REGEX = /\.html?$/
 const ANGULAR_COMPONENT_PREFIX = '@ng/component'
+
+/**
+ * True when `mod` is the module graph node for `normalizedFile` itself, and
+ * not a postfixed variant of it.
+ *
+ * Vite sets `mod.file` to `cleanUrl(mod.id)`, which strips `?` and `#`, so a
+ * template that application code also imports as `./tpl.html?raw` is filed
+ * under the same `file` and appears in `ctx.modules` too. Matching on `id`
+ * keeps the two apart: an exact match means same file, no postfix.
+ */
+function isModuleForFile(mod: ModuleNode, normalizedFile: string): boolean {
+  return !!mod.id && normalizePath(mod.id) === normalizedFile
+}
+
+/**
+ * Make `mod` its own HMR boundary, so an update stops there instead of
+ * propagating to the modules that import it.
+ *
+ * On the deprecated mixed module node, `isSelfAccepting` is a prototype
+ * getter with no setter. The flag therefore goes on the client-environment
+ * node it delegates to, which is both writable and the node Vite reads when
+ * it propagates the update. The node is mutated in place: a spread copy
+ * would drop every prototype getter, including the `id` Vite matches on.
+ */
+function markModuleSelfAccepting(mod: ModuleNode): void {
+  const clientModule = (mod as { _clientModule?: { isSelfAccepting?: boolean } })._clientModule
+  if (clientModule) {
+    clientModule.isSelfAccepting = true
+  }
+}
+
 type InlineBuildMinifyOptions = {
   cssMinify?: boolean | string
   minify?: boolean | string
@@ -753,13 +785,18 @@ export function angular(options: PluginOptions = {}): Plugin[] {
           const isSSR = !!options?.ssr
 
           // Track dependencies for resource cache invalidation and HMR.
-          // We don't call addWatchFile (which would create modules in Vite's
-          // graph) or maintain a custom watcher — Vite's chokidar sees the
-          // root tree via its normal HMR pipeline, and our `handleHotUpdate`
-          // hook below dispatches based on `resourceToComponent` membership.
-          // Preprocessor deps can resolve outside the root (shared monorepo
-          // packages, configured include paths), so those are registered with
-          // the watcher explicitly below.
+          // `handleHotUpdate` below dispatches based on `resourceToComponent`
+          // membership. Preprocessor deps can resolve outside the root
+          // (shared monorepo packages, configured include paths), so they are
+          // registered with the watcher explicitly below.
+          //
+          // `addWatchFile` does more than watch: `vite:import-analysis` folds
+          // plugin-added imports into the module graph, so each resource
+          // becomes a real module with this component `.ts` as its importer.
+          // That is load-bearing for templates. Vite full-reloads a changed
+          // `.html` whose module list is empty or holds no `js` module, and a
+          // template we hot-swap ourselves must not be in either state. See
+          // `handleHotUpdate` and https://github.com/voidzero-dev/oxc-angular-compiler/issues/443.
           if (watchMode && viteServer) {
             // Prune stale reverse mappings: if this component previously
             // referenced different resources (e.g., templateUrl was renamed),
@@ -791,6 +828,23 @@ export function angular(options: PluginOptions = {}): Plugin[] {
               // Watch the file so edits reach `handleHotUpdate` even when it
               // lives outside the dev-server root.
               viteServer.watcher?.add?.(dep)
+              // Templates only, and only while HMR is on.
+              //
+              // Styles must stay out of the graph: the import edge makes Vite
+              // propagate a style change up to this component `.ts` and
+              // re-execute it, which defines a duplicate class and leaves
+              // `angular:component-update` patching a class that is no longer
+              // mounted. Styles never needed it — Vite only force-reloads on
+              // `.html`.
+              //
+              // With `liveReload: false`, `handleHotUpdate` returns before it
+              // can use the edge, so the edge has no consumer other than
+              // Vite's default propagation — which is exactly what turns a
+              // payload the client would have dropped into an unconditional
+              // `full-reload` with path `*`.
+              if (pluginOptions.liveReload && TEMPLATE_REGEX.test(normalizedDep)) {
+                this.addWatchFile(dep)
+              }
             }
           }
 
@@ -1022,6 +1076,35 @@ export function angular(options: PluginOptions = {}): Plugin[] {
           // stylesheet that imports the same partial — must keep flowing
           // through Vite's default pipeline; returning [] would drop them and
           // leave that CSS stale.
+          //
+          // A template we just hot-swapped is the one exception. Vite sends a
+          // `full-reload` for any changed `.html` whose module list is empty
+          // or holds no `js` module. Its client normally drops that payload
+          // because the path does not match `location.pathname` — but in
+          // `middlewareMode` the path is `*`, which always reloads. So the
+          // update is applied and the page reloads on top of it (issue #443).
+          //
+          // `addWatchFile` in `transform` already put the template in the
+          // graph as a `js` module, which clears that branch. Marking it
+          // self-accepting makes it its own HMR boundary, so the update stops
+          // there instead of propagating up and re-executing the component
+          // `.ts` — a second evaluation would define a duplicate class
+          // (NG0912) and leave `angular:component-update` patching a class
+          // that is no longer mounted.
+          //
+          // The browser never imported the template, so Vite's client finds
+          // no `hotModulesMap` entry and the update is a no-op there. The DOM
+          // change comes entirely from `angular:component-update` above.
+          //
+          // Only the template's own node is marked. A variant the browser did
+          // import — `./tpl.html?raw` and friends — keeps propagating to its
+          // importers, which would otherwise hold a stale value: Vite would
+          // stop at a module with no `import.meta.hot.accept` handler.
+          if (handled && TEMPLATE_REGEX.test(normalizedFile)) {
+            for (const mod of ctx.modules) {
+              if (isModuleForFile(mod, normalizedFile)) markModuleSelfAccepting(mod)
+            }
+          }
           return ctx.modules
         }
 

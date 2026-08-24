@@ -56,10 +56,8 @@ afterAll(() => {
   rmSync(tempDir, { recursive: true, force: true })
 })
 
-function getAngularPlugin() {
-  const plugin = angular({ liveReload: true }).find(
-    (candidate) => candidate.name === '@oxc-angular/vite',
-  )
+function getAngularPlugin(options: Parameters<typeof angular>[0] = { liveReload: true }) {
+  const plugin = angular(options).find((candidate) => candidate.name === '@oxc-angular/vite')
 
   if (!plugin) {
     throw new Error('Failed to find @oxc-angular/vite plugin')
@@ -98,6 +96,27 @@ function createMockServer() {
     },
     _wsMessages: wsMessages,
     _unwatchedFiles: unwatchedFiles,
+  }
+}
+
+/**
+ * Mock of Vite's mixed module node.
+ *
+ * `isSelfAccepting` is a prototype getter with no setter on the real node, so
+ * the plugin writes the flag to the client-environment node it delegates to.
+ * The returned `clientModule` is that node, so a test can assert on it.
+ */
+function createMockTemplateModule(
+  id: string,
+  file: string = id,
+): {
+  module: Partial<ModuleNode>
+  clientModule: { isSelfAccepting: boolean }
+} {
+  const clientModule = { isSelfAccepting: false }
+  return {
+    module: { id, file, _clientModule: clientModule } as unknown as Partial<ModuleNode>,
+    clientModule,
   }
 }
 
@@ -188,11 +207,19 @@ async function transformComponent(plugin: Plugin) {
     throw new Error('Expected plugin transform handler')
   }
 
+  const watched: string[] = []
   await plugin.transform.handler.call(
-    { error() {}, warn() {} } as any,
+    {
+      error() {},
+      warn() {},
+      addWatchFile(id: string) {
+        watched.push(normalizePath(id))
+      },
+    } as any,
     COMPONENT_SOURCE,
     componentPath,
   )
+  return watched
 }
 
 /**
@@ -286,7 +313,7 @@ describe('pendingHmrUpdates race condition', () => {
       throw new Error('Expected plugin transform handler')
     }
     await plugin.transform.handler.call(
-      { error() {}, warn() {} } as any,
+      { error() {}, warn() {}, addWatchFile() {} } as any,
       originalSource,
       multiComponentPath,
     )
@@ -332,7 +359,7 @@ describe('pendingHmrUpdates race condition', () => {
       throw new Error('Expected plugin transform handler')
     }
     await plugin.transform.handler.call(
-      { error() {}, warn() {} } as any,
+      { error() {}, warn() {}, addWatchFile() {} } as any,
       source,
       multiComponentPath,
     )
@@ -373,7 +400,11 @@ describe('pendingHmrUpdates race condition', () => {
     if (!plugin.transform || typeof plugin.transform === 'function') {
       throw new Error('Expected plugin transform handler')
     }
-    await plugin.transform.handler.call({ error() {}, warn() {} } as any, source, multiStylesPath)
+    await plugin.transform.handler.call(
+      { error() {}, warn() {}, addWatchFile() {} } as any,
+      source,
+      multiStylesPath,
+    )
 
     // Edit only YComponent's styles. Stripping wipes BOTH components' styles
     // (and templates), so old and new stripped forms must still match.
@@ -416,7 +447,11 @@ describe('pendingHmrUpdates race condition', () => {
     if (!plugin.transform || typeof plugin.transform === 'function') {
       throw new Error('Expected plugin transform handler')
     }
-    await plugin.transform.handler.call({ error() {}, warn() {} } as any, source, multiUrlPath)
+    await plugin.transform.handler.call(
+      { error() {}, warn() {}, addWatchFile() {} } as any,
+      source,
+      multiUrlPath,
+    )
 
     // Edit just first.component.html. resourceToComponent maps it to
     // multi-url.component.ts; dispatchAllComponentsInFile must fan out to
@@ -454,7 +489,11 @@ describe('pendingHmrUpdates race condition', () => {
     if (!plugin.transform || typeof plugin.transform === 'function') {
       throw new Error('Expected plugin transform handler')
     }
-    await plugin.transform.handler.call({ error() {}, warn() {} } as any, originalSource, stalePath)
+    await plugin.transform.handler.call(
+      { error() {}, warn() {}, addWatchFile() {} } as any,
+      originalSource,
+      stalePath,
+    )
 
     // Trigger an HMR-eligible edit so a pending entry is queued for both
     // components (including DropComponent).
@@ -471,7 +510,11 @@ describe('pendingHmrUpdates race condition', () => {
       export class KeepComponent {}
     `
     writeFileSync(stalePath, reducedSource)
-    await plugin.transform.handler.call({ error() {}, warn() {} } as any, reducedSource, stalePath)
+    await plugin.transform.handler.call(
+      { error() {}, warn() {}, addWatchFile() {} } as any,
+      reducedSource,
+      stalePath,
+    )
 
     const middleware = (mockServer.middlewares.use as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]
 
@@ -501,7 +544,11 @@ describe('pendingHmrUpdates race condition', () => {
     if (!plugin.transform || typeof plugin.transform === 'function') {
       throw new Error('Expected plugin transform handler')
     }
-    await plugin.transform.handler.call({ error() {}, warn() {} } as any, source, multiReloadPath)
+    await plugin.transform.handler.call(
+      { error() {}, warn() {}, addWatchFile() {} } as any,
+      source,
+      multiReloadPath,
+    )
 
     // Change a class member, NOT the template/styles. The stripped form will
     // differ from the cached one → full reload, no HMR.
@@ -606,19 +653,63 @@ describe('handleHotUpdate - Issue #185', () => {
     const mockServer = await setupPluginWithServer(plugin)
     await transformComponent(plugin)
 
-    // The component's HTML template IS in resourceToComponent
+    // The component's HTML template IS in resourceToComponent.
+    // `_clientModule` mirrors Vite's mixed module node: `isSelfAccepting` is
+    // a prototype getter there, so the flag lands on the client node.
     const componentHtmlFile = normalizePath(templatePath)
-    const mockModules = [{ id: componentHtmlFile }]
-    const ctx = createMockHmrContext(componentHtmlFile, mockModules, mockServer)
+    const { module: templateModule, clientModule } = createMockTemplateModule(componentHtmlFile)
+    const ctx = createMockHmrContext(componentHtmlFile, [templateModule], mockServer)
 
     const result = await callHandleHotUpdate(plugin, ctx)
 
-    // Component HMR is dispatched, and Vite's modules are preserved for the
-    // default pipeline.
-    expect(result).toEqual(mockModules)
+    // Component HMR is dispatched, and the template module becomes its own
+    // HMR boundary. Without that, Vite sends a `full-reload` for the changed
+    // `.html` on top of the update we just dispatched — and that reload is
+    // unconditional in `middlewareMode`, where its path is `*`.
+    // See https://github.com/voidzero-dev/oxc-angular-compiler/issues/443.
+    expect(result).toEqual([templateModule])
+    expect(clientModule.isSelfAccepting).toBe(true)
     expect(mockServer._wsMessages).toContainEqual(
       expect.objectContaining({ type: 'custom', event: 'angular:component-update' }),
     )
+  })
+
+  it('should not mark a postfixed variant of the template as self-accepting', async () => {
+    const plugin = getAngularPlugin()
+    const mockServer = await setupPluginWithServer(plugin)
+    await transformComponent(plugin)
+
+    // Vite sets `file` to `cleanUrl(id)`, so a browser-imported
+    // `./app.component.html?raw` is filed under the template's path and shows
+    // up in `ctx.modules` alongside the node `addWatchFile` created.
+    const componentHtmlFile = normalizePath(templatePath)
+    const bare = createMockTemplateModule(componentHtmlFile)
+    const raw = createMockTemplateModule(`${componentHtmlFile}?raw`, componentHtmlFile)
+    const ctx = createMockHmrContext(componentHtmlFile, [bare.module, raw.module], mockServer)
+
+    await callHandleHotUpdate(plugin, ctx)
+
+    // Only the template itself becomes the boundary.
+    expect(bare.clientModule.isSelfAccepting).toBe(true)
+    // The `?raw` variant has real importers holding its value. Stopping
+    // propagation there would leave them with a stale string, because the
+    // browser has no `import.meta.hot.accept` handler for it.
+    expect(raw.clientModule.isSelfAccepting).toBe(false)
+  })
+
+  it('should not mark non-component HTML as self-accepting', async () => {
+    const plugin = getAngularPlugin()
+    await setupPluginWithServer(plugin)
+
+    // index.html must keep reloading the page — it is not hot-swappable.
+    const indexHtml = normalizePath(join(tempDir, 'index.html'))
+    const { module: indexModule, clientModule } = createMockTemplateModule(indexHtml)
+    const ctx = createMockHmrContext(indexHtml, [indexModule])
+
+    const result = await callHandleHotUpdate(plugin, ctx)
+
+    expect(result).toEqual([indexModule])
+    expect(clientModule.isSelfAccepting).toBe(false)
   })
 
   it('should not swallow non-resource HTML files', async () => {
@@ -676,9 +767,7 @@ describe('handleHotUpdate - Issue #185', () => {
   })
 
   it('should not act when liveReload is disabled', async () => {
-    const plugin = angular({ liveReload: false }).find(
-      (candidate) => candidate.name === '@oxc-angular/vite',
-    )!
+    const plugin = getAngularPlugin({ liveReload: false })
     const mockServer = await setupPluginWithServer(plugin)
 
     const utilFile = normalizePath(join(tempDir, 'src', 'utils.ts'))
@@ -688,5 +777,27 @@ describe('handleHotUpdate - Issue #185', () => {
 
     // No HMR or full-reload should be sent when liveReload is off.
     expect(mockServer._wsMessages).toHaveLength(0)
+  })
+
+  it('should not add template graph edges when liveReload is disabled', async () => {
+    const plugin = getAngularPlugin({ liveReload: false })
+    await setupPluginWithServer(plugin)
+
+    const watched = await transformComponent(plugin)
+
+    // The graph edge exists only to keep Vite off its `.html` reload branch
+    // during HMR. With HMR off, `handleHotUpdate` returns before it can use
+    // the edge, and the edge alone turns Vite's dropped `.html` payload into
+    // an unconditional `full-reload` with path `*`.
+    expect(watched).toEqual([])
+  })
+
+  it('should add a template graph edge when liveReload is enabled', async () => {
+    const plugin = getAngularPlugin()
+    await setupPluginWithServer(plugin)
+
+    const watched = await transformComponent(plugin)
+
+    expect(watched).toContain(normalizePath(templatePath))
   })
 })
